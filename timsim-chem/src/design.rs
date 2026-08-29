@@ -1936,9 +1936,77 @@ mod tests {
         assert!(small.is_subset(&large), "raising n_proteins must extend, not reshuffle");
     }
 
+    /// `p99/p50` of a set, and of its brightest `frac` — the SHAPE statistic. It is invariant under
+    /// any rescale, so it survives the renderer's intensity calibration and is directly comparable
+    /// against a real run's DIA-NN report.
+    fn tail_ratio(v: &[f64], frac: f64) -> f64 {
+        let mut w: Vec<f64> = v.to_vec();
+        w.sort_by(|a, b| a.total_cmp(b));
+        let w = &w[w.len() - ((w.len() as f64 * frac) as usize).max(2)..];
+        let q = |p: f64| w[(((w.len() - 1) as f64) * p).round() as usize];
+        q(0.99) / q(0.50)
+    }
+
+    /// **The abundance marginal must keep its quantile ratio roughly stable as detection goes
+    /// deeper.** This is the property `the_hockey_stick_curve_gives_a_realistic_dynamic_range`
+    /// cannot see, and the one real data actually has.
+    ///
+    /// Measured on the LFQ Benchmark Gen Beta DIA-NN reports (2026-08-29), subsampling the top-N
+    /// precursors WITHIN a single run: `p99/p50` grows only **2.5x** (Bruker Ultra 2, 9.6 -> 24.1)
+    /// to **2.9x** (Astral, 12.2 -> 35.1) across a 20x depth range. `HockeyStick { decay: 0.06,
+    /// tail: 1e-4 }` grows **1655x** over the same range, because its `+ tail` term puts 45% of
+    /// proteins on a FLAT SHELF at one identical abundance: `p50` lands on the shelf as soon as the
+    /// bottom half is included while `p99` stays up in the exponential head. A log-normal has no
+    /// shelf and comes in at ~5x.
+    ///
+    /// The bound here is 8x — loose enough not to be brittle against the seed and the 3x real
+    /// figure, tight enough that the shelf fails it by two orders of magnitude.
+    #[test]
+    fn the_abundance_marginal_keeps_its_quantile_ratio_stable_with_depth() {
+        let ps: Vec<(String, String, String)> = (0..5000)
+            .map(|i| (format!("P{i}"), "PEPTIDEKAAAKCCCRDDDK".repeat(5), "HUMAN".to_string()))
+            .collect();
+        let dp: Vec<DesignProtein> = ps.iter()
+            .map(|(id, seq, org)| DesignProtein { id, sequence: seq, organism: org }).collect();
+        let mut abundance = BTreeMap::new();
+        // sigma in NATURAL-LOG units. Real protein-level log10 sd is 0.57-1.00 across Bruker,
+        // Astral and SCIEX; 2.0 (log10 ~0.87) sits inside that, and is the crate's own documented
+        // default for "the dynamic range a real proteome spans".
+        abundance.insert("HUMAN".to_string(), AbundanceProfile::LogNormal { sigma: 2.0 });
+        let s = DesignSpec {
+            reference: "A".into(), load_ng: 200.0, complexity: Complexity::default(),
+            abundance, seed: 11, variance: Variance::default(),
+            conditions: vec![Condition {
+                name: "A".into(),
+                mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
+                replicates: 1, technical_replicates: 1, regulate: Vec::new(),
+            }],
+        };
+        let d = resolve(&s, &dp).unwrap();
+        let v: Vec<f64> = d.protein_quantities.iter().map(|q| q.amount_amol).filter(|x| *x > 0.0).collect();
+        assert!(v.len() > 100, "need a populated set to measure a marginal, got {}", v.len());
+
+        let shallow = tail_ratio(&v, 0.05);
+        let full = tail_ratio(&v, 1.0);
+        let swing = full / shallow;
+        assert!(
+            swing <= 8.0,
+            "p99/p50 must not explode with depth: {shallow:.1} (top 5%) -> {full:.1} (all) = \
+             {swing:.1}x. Real data gives 2.5-2.9x over this range; a HockeyStick `+ tail` shelf \
+             gives ~1655x. A swing this large means the marginal has a flat shelf, which corrupts \
+             the recall-vs-abundance and recall-vs-load curves the benchmark rests on."
+        );
+    }
+
     /// The hockey-stick rank-abundance curve reproduces v1's shape — but keyed by identity, so
     /// adding a protein does not reshuffle everyone else's abundance (v1's
     /// `np.random.uniform(1, 1e4, n)` is draw-order dependent, and does).
+    ///
+    /// **This test checks the RANGE and cannot see the SHAPE.** It passes on a marginal whose
+    /// `p99/p50` is 1655x-unstable with depth — see
+    /// `the_abundance_marginal_keeps_its_quantile_ratio_stable_with_depth`, which the hockey stick
+    /// FAILS. Spanning the right number of orders is necessary and nowhere near sufficient; this is
+    /// the same "total right / distribution wrong" trap the render calibration hit.
     #[test]
     fn the_hockey_stick_curve_gives_a_realistic_dynamic_range() {
         let ps: Vec<(String, String, String)> = (0..5000)
