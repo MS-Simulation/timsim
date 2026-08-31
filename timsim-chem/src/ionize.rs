@@ -315,11 +315,25 @@ impl ChargeModel {
 /// See SPEC §8.2.
 #[derive(Clone, Copy, Debug)]
 pub enum Flyability {
-    /// v1's model: a normal draw in log10 space, **rejection-truncated** to `[lo, hi]`.
+    /// A normal draw in log10 space, **rejection-truncated** to `[lo, hi]`.
     ///
-    /// With v1's parameters (median 1e-2, σ = 1, clipped to [1e-4, 1]) the bounds sit at **±2σ**, so
-    /// the truncation is not cosmetic — it removes ~4.6% of the mass and gives the distribution hard
-    /// edges rather than tails.
+    /// **The default sigma is 1.0 and that is NOT v1's value.** v1's `generate_normal_efficiency`
+    /// uses `std_log = 0.6` (log10). The median (1e-2) and the bounds ([1e-4, 1]) do match v1; the
+    /// sigma does not, and an earlier version of this comment claimed it did. Measured over a full
+    /// human digest (9,010,877 precursors), the drawn `ionization_propensity` has log10 sd **0.880**
+    /// at sigma = 1.0 and **0.597** at 0.6 — so this runs ~1.47x wider than v1.
+    ///
+    /// 1.0 is kept because it is what the EVIDENCE supports, not out of parity: a 3v3 timsTOF cohort
+    /// rendered and searched at sigma = 1.0 (with abundance sigma 1.6, n_proteins 9000) gives a
+    /// searched log10 sd of 0.437 against real Bruker Ultra 2's 0.483 — already slightly NARROW, so
+    /// narrowing flyability to 0.6 would move it further from the data, not closer. v1 was itself a
+    /// model; parity with it is not a claim about reality.
+    ///
+    /// **This sigma is not separately identifiable from the abundance sigma** — intensity observes
+    /// only their product — so the two should be fitted jointly rather than set independently.
+    ///
+    /// The truncation is not cosmetic: at sigma = 1.0 the bounds sit at ±2σ, removing ~4.6% of the
+    /// mass and giving the distribution hard edges rather than tails.
     ///
     /// Unlike v1's bulk `np.random.normal(size=n)` (assigned by row order, so adding a peptide
     /// reshuffles everyone), this is **identity-keyed**: a peptide's flyability depends only on its
