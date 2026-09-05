@@ -190,7 +190,7 @@ pub struct Condition {
 /// Declare it in both places and you double-count the same effect; and then "how much of this CV
 /// is biology and how much is the instrument?" — the one question this design exists to answer —
 /// becomes unanswerable.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Variance {
     /// **Mean** CV across proteins, between biological replicates.
     pub biological: f64,
@@ -202,6 +202,28 @@ pub struct Variance {
     /// replicate is the same tube, so its *amounts* are identical. Its abundance dependence should
     /// emerge from ion counting, not from this number.
     pub technical: f64,
+    /// Per-protein multipliers on the drawn CV, keyed by protein id. A protein listed here gets
+    /// `cv_i * m` instead of `cv_i`; anything absent is unaffected.
+    ///
+    /// # Why a MULTIPLIER and not a CV
+    ///
+    /// Measured class variability comes from SEARCHED data, which carries measurement noise on top
+    /// of the biology. Writing an absolute CV here would author that noise a second time, since the
+    /// renderer adds it downstream. A ratio between two classes measured the same way largely
+    /// cancels the shared noise term — and what it does not cancel is CONSERVATIVE: noise inflates
+    /// both sides, so an observed ratio is compressed toward 1 and understates the true spread.
+    ///
+    /// # Why this is not the same as `biological_heterogeneity`
+    ///
+    /// Heterogeneity draws each protein's CV at random. That produces a distribution of roughly the
+    /// right WIDTH while assigning it by dice: a tightly-controlled protein is as likely to be drawn
+    /// variable as not. This map is for the cases where the class is actually KNOWN — measured in
+    /// real plasma, complement sits at 0.78x the baseline and immunoglobulin at 1.33x, after
+    /// matching on abundance so the difference cannot be a counting-noise artifact.
+    ///
+    /// It matters most for a planted set: if four of fourteen regulated proteins are complement,
+    /// a random draw can make exactly those proteins arbitrarily easy or hard by chance.
+    pub cv_multipliers: std::collections::HashMap<String, f64>,
 }
 
 /// How many proteins are actually *in* the sample.
@@ -1054,6 +1076,10 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 } else {
                     mean_cv
                 };
+                // A known class multiplier overrides the dice for this protein. Applied AFTER the
+                // random draw, not instead of it, so a listed protein keeps its share of generic
+                // heterogeneity and is merely shifted — a class is a tendency, not a constant.
+                let cv_i = cv_i * spec.variance.cv_multipliers.get(p.id).copied().unwrap_or(1.0);
 
                 // The user declares a **coefficient of variation**, not a log-space sigma. A
                 // log-normal with log-sigma `s` has CV sqrt(exp(s^2) - 1), so feeding the CV in
@@ -1211,6 +1237,7 @@ mod tests {
                 biological: bio_cv,
                 biological_heterogeneity: 0.0, // most tests want the homoscedastic case
                 technical: 0.05,
+                ..Default::default()
             },
             seed: 42,
             conditions: vec![
@@ -1722,6 +1749,54 @@ mod tests {
         }
     }
 
+    /// A `cv_multipliers` entry must SHIFT that protein's realised spread, and leave others alone.
+    ///
+    /// Measured in real plasma (abundance-matched, so the difference is not a counting-noise
+    /// artifact) complement sits at 0.78x the baseline spread and immunoglobulin at 1.33x. Four of
+    /// the fourteen planted proteins in the COVID design are complement, so a random per-protein
+    /// draw can make exactly the proteins the benchmark turns on arbitrarily easy or hard.
+    #[test]
+    fn a_cv_multiplier_shifts_only_the_proteins_it_names() {
+        let ps = hye_proteins();
+        let mut base = spec(200.0, 0.40);
+        base.conditions[0].replicates = 40; // enough replicates for a stable sd
+        base.conditions[1].replicates = 40;
+
+        let named = "HUM0";
+        let mut shifted = base.clone();
+        shifted.variance.cv_multipliers.insert(named.to_string(), 0.25);
+
+        let sd_of = |d: &Design, id: &str| -> f64 {
+            let v: Vec<f64> = d
+                .protein_quantities
+                .iter()
+                .filter(|q| q.protein_id == id && q.sample_id.starts_with("A_"))
+                .map(|q| q.amount_amol.max(1e-12).ln())
+                .collect();
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            (v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt()
+        };
+
+        let d0 = run(&base, &ps);
+        let d1 = run(&shifted, &ps);
+
+        let (a0, a1) = (sd_of(&d0, named), sd_of(&d1, named));
+        assert!(a0 > 0.05, "fixture must actually vary, got sd {a0:.4}");
+        assert!(
+            a1 < a0 * 0.5,
+            "multiplier 0.25 must visibly tighten the named protein: {a0:.4} -> {a1:.4}"
+        );
+
+        // Every OTHER protein is untouched: a multiplier must not act as a global rescale, and the
+        // load renormalisation must not smear it across the proteome.
+        let other = "HUM1";
+        let (b0, b1) = (sd_of(&d0, other), sd_of(&d1, other));
+        assert!(
+            (b1 - b0).abs() < 0.05 * b0.max(1e-9) + 1e-6,
+            "an unlisted protein must be unaffected: {b0:.4} -> {b1:.4}"
+        );
+    }
+
     /// REGRESSION: the declared biological CV must actually BE the CV.
     ///
     /// It was used directly as the log-space sigma of the log-normal jitter — but a log-normal
@@ -1753,7 +1828,7 @@ mod tests {
                 load_ng: 200.0,
                 complexity: Complexity::default(),
                 abundance,
-                variance: Variance { biological: declared, biological_heterogeneity: 0.0, technical: 0.0 },
+                variance: Variance { biological: declared, biological_heterogeneity: 0.0, technical: 0.0, ..Default::default() },
                 seed: 7,
                 conditions: vec![Condition {
                     name: "A".into(),
@@ -1802,7 +1877,7 @@ mod tests {
             DesignSpec {
                 reference: "A".into(), load_ng: 200.0, complexity: Complexity::default(),
                 abundance, seed: 3,
-                variance: Variance { biological: 0.2, biological_heterogeneity: het, technical: 0.0 },
+                variance: Variance { biological: 0.2, biological_heterogeneity: het, technical: 0.0, ..Default::default() },
                 conditions: vec![Condition {
                     name: "A".into(),
                     mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
