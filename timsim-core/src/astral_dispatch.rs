@@ -10,6 +10,7 @@
 
 #![cfg(feature = "thermo")]
 
+use mscore::simulation::noise_rng::noise_rng;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -56,6 +57,10 @@ pub struct AstralWriteOptions {
     /// noise" workflow). On a packet-budget overflow in Overlay mode the slot keeps
     /// the template signal untouched (no clear).
     pub superimpose_ppm: f64,
+    /// Master seed for the m/z noise. Each scan's jitter is drawn from an RNG keyed on this seed,
+    /// the frame id and the MS level (`mscore::simulation::noise_rng`), so the authored `.raw` does
+    /// not depend on thread scheduling. 0 = default stream (still reproducible).
+    pub noise_seed: u64,
 }
 
 impl Default for AstralWriteOptions {
@@ -68,6 +73,7 @@ impl Default for AstralWriteOptions {
             precursor_noise_ppm: 0.0,
             fragment_noise_ppm: 0.0,
             superimpose_ppm: 0.0,
+            noise_seed: 0,
         }
     }
 }
@@ -87,7 +93,9 @@ fn cap_top_intensity(peaks: &mut Vec<(f64, f32)>, max: usize) {
 /// normal mass-error distribution to mass-calibrate against (a perfectly-zero-error
 /// spectrum is degenerate for that fit). Reuses the same `MzSpectrum` primitive the
 /// Bruker path uses; Gaussian (not the TOF-shaped uniform/right-drag) fits FT optics.
-fn apply_mz_noise(peaks: &mut Vec<(f64, f32)>, ppm: f64) {
+/// `rng` is the scan's own stream (see [`AstralWriteOptions::noise_seed`]); drawing from
+/// `thread_rng` here made the authored file depend on which worker rendered the scan.
+fn apply_mz_noise<R: rand::Rng>(peaks: &mut Vec<(f64, f32)>, ppm: f64, rng: &mut R) {
     // Non-finite or non-positive ppm = noise off (defensive — the PyO3 boundary also
     // rejects non-finite/negative ppm up front, so a NaN never reaches Normal::new).
     if !ppm.is_finite() || ppm <= 0.0 || peaks.is_empty() {
@@ -95,7 +103,7 @@ fn apply_mz_noise(peaks: &mut Vec<(f64, f32)>, ppm: f64) {
     }
     let mz: Vec<f64> = peaks.iter().map(|(m, _)| *m).collect();
     let inten: Vec<f64> = peaks.iter().map(|(_, i)| *i as f64).collect();
-    let noised = MzSpectrum::new(mz, inten).add_mz_noise_normal(ppm);
+    let noised = MzSpectrum::new(mz, inten).add_mz_noise_normal_with_rng(ppm, rng);
     *peaks = noised
         .mz
         .iter()
@@ -213,7 +221,7 @@ pub fn write_astral_raw(
             let mut d = ScanDescriptor::from_rendered_event(&ev, 0.0)?;
             // Mass-error noise BEFORE the grid-extent filter, so a peak jittered just
             // past the FTMS grid edge is dropped rather than clamped.
-            apply_mz_noise(&mut d.peaks, opts.precursor_noise_ppm);
+            apply_mz_noise(&mut d.peaks, opts.precursor_noise_ppm, &mut noise_rng(opts.noise_seed, &[frame_id as u64, 1]));
             // Keep only peaks within this scan's FTMS frequency-grid m/z extent.
             if let Some(p) = raw.profile(slot_scan) {
                 let a = p.mz_of_bin(0, &calib);
@@ -230,7 +238,7 @@ pub fn write_astral_raw(
             let wt = WindowTransmission::new(center, width, opts.quad_k);
             let ev = builder.render_fragment_scan(frame_id, &wt, ce, DataMode::Centroid);
             let mut d = ScanDescriptor::from_rendered_event(&ev, ce)?;
-            apply_mz_noise(&mut d.peaks, opts.fragment_noise_ppm);
+            apply_mz_noise(&mut d.peaks, opts.fragment_noise_ppm, &mut noise_rng(opts.noise_seed, &[frame_id as u64, 2]));
             cap_top_intensity(&mut d.peaks, opts.max_ms2_peaks);
             (d, ce)
         };
@@ -282,4 +290,33 @@ pub fn write_astral_raw(
         overflow_cleared,
         checksum_valid: check.checksum_valid(),
     })
+}
+
+#[cfg(test)]
+mod noise_seed_tests {
+    use super::*;
+
+    fn peaks() -> Vec<(f64, f32)> {
+        vec![(400.1234, 1000.0), (650.4321, 250.0), (1200.9876, 80.0)]
+    }
+
+    #[test]
+    fn seeded_scan_noise_is_reproducible_and_frame_specific() {
+        let (mut a, mut b, mut c) = (peaks(), peaks(), peaks());
+        apply_mz_noise(&mut a, 5.0, &mut noise_rng(41, &[10, 2]));
+        apply_mz_noise(&mut b, 5.0, &mut noise_rng(41, &[10, 2]));
+        apply_mz_noise(&mut c, 5.0, &mut noise_rng(41, &[11, 2]));
+        assert_eq!(a, b, "same seed + frame + level must give the same jitter");
+        assert_ne!(a, c, "another frame must not share the stream");
+        for ((m0, _), (m1, _)) in peaks().iter().zip(a.iter()) {
+            assert!((m1 - m0).abs() <= m0 * 5.0 / 1e6 * 2.0, "{m0} -> {m1} is far outside 5 ppm");
+        }
+    }
+
+    #[test]
+    fn zero_ppm_leaves_peaks_untouched() {
+        let mut a = peaks();
+        apply_mz_noise(&mut a, 0.0, &mut noise_rng(41, &[1, 1]));
+        assert_eq!(a, peaks());
+    }
 }

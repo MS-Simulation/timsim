@@ -34,12 +34,18 @@ impl SignalDistribution {
 
     pub fn add_noise(&self, noise_level: f32) -> Vec<f32> {
         let mut rng = rand::thread_rng();
+        self.add_noise_with_rng(noise_level, &mut rng)
+    }
+
+    /// Reproducible counterpart of `add_noise`: draw from a caller-supplied RNG, e.g.
+    /// `mscore::simulation::noise_rng::noise_rng(seed, &[peptide_id])`.
+    pub fn add_noise_with_rng<R: rand::Rng>(&self, noise_level: f32, rng: &mut R) -> Vec<f32> {
         let noise_dist = Uniform::new(0.0, noise_level);
 
         let noise: Vec<f32> = self
             .abundance
             .iter()
-            .map(|_| noise_dist.sample(&mut rng))
+            .map(|_| noise_dist.sample(rng))
             .collect();
         let noise_relative: Vec<f32> = self
             .abundance

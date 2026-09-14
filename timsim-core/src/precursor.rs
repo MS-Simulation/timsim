@@ -13,6 +13,7 @@ use crate::containers::{FramesSim, IonSim, PeptidesSim, ScansSim};
 use crate::handle::TimsTofSyntheticsDataHandle;
 use crate::projector::{IntensityStage, MzCoordSpace, RenderedEvent, RenderedSpectrum};
 use crate::scheme::DataMode;
+use mscore::simulation::noise_rng::noise_rng;
 use rayon::prelude::*;
 
 pub struct TimsTofSyntheticsPrecursorFrameBuilder {
@@ -37,9 +38,19 @@ pub struct TimsTofSyntheticsPrecursorFrameBuilder {
     pub peptide_to_events: BTreeMap<u32, f32>,
     /// Mapping from ion_id to (peptide_id, charge) for DDA precursor lookup
     pub ion_id_to_peptide_charge: BTreeMap<u32, (u32, i8)>,
+    /// Master seed for the simulation's noise (m/z jitter, precursor-survival draw). Every draw is
+    /// keyed on this seed plus the frame id (`mscore::simulation::noise_rng`), so a run's noise does
+    /// not depend on which thread built a frame. 0 is the default for API users that never set it
+    /// — still reproducible, just seed 0.
+    pub noise_seed: u64,
 }
 
 impl TimsTofSyntheticsPrecursorFrameBuilder {
+
+    /// Set the master seed for the simulation's noise, making a run reproducible from its config.
+    pub fn set_noise_seed(&mut self, seed: u64) {
+        self.noise_seed = seed;
+    }
     /// Create a new instance of TimsTofSynthetics
     ///
     /// # Arguments
@@ -103,6 +114,7 @@ impl TimsTofSyntheticsPrecursorFrameBuilder {
             scan_to_mobility: TimsTofSyntheticsDataHandle::build_scan_to_mobility(&scans),
             peptide_to_events: TimsTofSyntheticsDataHandle::build_peptide_to_events(&peptides),
             ion_id_to_peptide_charge,
+            noise_seed: 0,
         }
     }
 
@@ -245,6 +257,9 @@ impl TimsTofSyntheticsPrecursorFrameBuilder {
         precursor_noise_ppm: f64,
         right_drag: bool,
     ) -> TimsFrame {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         // Cache frame-level lookups
         let ms_type = if self.precursor_frame_id_set.contains(&frame_id) {
             MsType::Precursor
@@ -262,9 +277,9 @@ impl TimsTofSyntheticsPrecursorFrameBuilder {
         for (scan, scaled_spec) in contributions {
             let mz_spectrum = if mz_noise_precursor {
                 if uniform {
-                    scaled_spec.add_mz_noise_uniform(precursor_noise_ppm, right_drag)
+                    scaled_spec.add_mz_noise_uniform_with_rng(precursor_noise_ppm, right_drag, &mut rng)
                 } else {
-                    scaled_spec.add_mz_noise_normal(precursor_noise_ppm)
+                    scaled_spec.add_mz_noise_normal_with_rng(precursor_noise_ppm, &mut rng)
                 }
             } else {
                 scaled_spec
@@ -353,6 +368,9 @@ impl TimsTofSyntheticsPrecursorFrameBuilder {
         precursor_noise_ppm: f64,
         right_drag: bool,
     ) -> TimsFrameAnnotated {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         // Cache frame-level lookups
         let ms_type = if self.precursor_frame_id_set.contains(&frame_id) {
             MsType::Precursor
@@ -402,9 +420,9 @@ impl TimsTofSyntheticsPrecursorFrameBuilder {
 
                     let mz_spectrum = if mz_noise_precursor {
                         if uniform {
-                            scaled_spec.add_mz_noise_uniform(precursor_noise_ppm, right_drag)
+                            scaled_spec.add_mz_noise_uniform_with_rng(precursor_noise_ppm, right_drag, &mut rng)
                         } else {
-                            scaled_spec.add_mz_noise_normal(precursor_noise_ppm)
+                            scaled_spec.add_mz_noise_normal_with_rng(precursor_noise_ppm, &mut rng)
                         }
                     } else {
                         scaled_spec
@@ -554,6 +572,7 @@ mod tests {
             scan_to_mobility: BTreeMap::new(),
             peptide_to_events,
             ion_id_to_peptide_charge: BTreeMap::new(),
+            noise_seed: 0,
         }
     }
 

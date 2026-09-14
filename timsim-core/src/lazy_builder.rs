@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use mscore::simulation::noise_rng::noise_rng;
 use rayon::prelude::*;
 
 use crate::containers::{FragmentIonSim, FramesSim, IonSim, PeptidesSim, ScansSim};
@@ -51,9 +52,19 @@ pub struct TimsTofLazyFrameBuilderDIA {
     pub num_threads: usize,
     /// Source for occurrence/abundance distributions (legacy columns or projector)
     pub source: DistributionSource,
+    /// Master seed for the simulation's noise (m/z jitter, precursor-survival draw). Every draw is
+    /// keyed on this seed plus the frame id (`mscore::simulation::noise_rng`), so a run's noise does
+    /// not depend on which thread built a frame. 0 is the default for API users that never set it
+    /// — still reproducible, just seed 0.
+    pub noise_seed: u64,
 }
 
 impl TimsTofLazyFrameBuilderDIA {
+
+    /// Set the master seed for the simulation's noise, making a run reproducible from its config.
+    pub fn set_noise_seed(&mut self, seed: u64) {
+        self.noise_seed = seed;
+    }
     /// Create a new lazy frame builder.
     ///
     /// Only loads static metadata (frames, scans, transmission settings).
@@ -106,6 +117,7 @@ impl TimsTofLazyFrameBuilderDIA {
             fragmentation_settings,
             num_threads,
             source,
+            noise_seed: 0,
         })
     }
 
@@ -295,6 +307,9 @@ impl TimsTofLazyFrameBuilderDIA {
         frame_to_abundances: &BTreeMap<u32, (Vec<u32>, Vec<f32>)>,
         peptide_to_events: &BTreeMap<u32, f32>,
     ) -> TimsFrame {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         let ms_type = MsType::Precursor;
         let rt = *self.frame_to_rt.get(&frame_id).unwrap_or(&0.0) as f64;
 
@@ -328,9 +343,9 @@ impl TimsTofLazyFrameBuilderDIA {
 
                     let mz_spectrum = if mz_noise_precursor {
                         if uniform {
-                            scaled_spec.add_mz_noise_uniform(precursor_noise_ppm, right_drag)
+                            scaled_spec.add_mz_noise_uniform_with_rng(precursor_noise_ppm, right_drag, &mut rng)
                         } else {
-                            scaled_spec.add_mz_noise_normal(precursor_noise_ppm)
+                            scaled_spec.add_mz_noise_normal_with_rng(precursor_noise_ppm, &mut rng)
                         }
                     } else {
                         scaled_spec
@@ -385,6 +400,9 @@ impl TimsTofLazyFrameBuilderDIA {
         peptide_to_events: &BTreeMap<u32, f32>,
         fragment_ions_map: &Option<BTreeMap<(u32, i8, i32), (PeptideProductIonSeriesCollection, Vec<MzSpectrum>)>>,
     ) -> TimsFrame {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         let ms_type = MsType::FragmentDia;
         let rt = *self.frame_to_rt.get(&frame_id).unwrap_or(&0.0) as f64;
 
@@ -478,9 +496,9 @@ impl TimsTofLazyFrameBuilderDIA {
 
                         let mz_spectrum = if mz_noise_fragment {
                             if uniform {
-                                scaled_spec.add_mz_noise_uniform(fragment_noise_ppm, right_drag)
+                                scaled_spec.add_mz_noise_uniform_with_rng(fragment_noise_ppm, right_drag, &mut rng)
                             } else {
-                                scaled_spec.add_mz_noise_normal(fragment_noise_ppm)
+                                scaled_spec.add_mz_noise_normal_with_rng(fragment_noise_ppm, &mut rng)
                             }
                         } else {
                             scaled_spec
@@ -581,9 +599,19 @@ pub struct TimsTofLazyFrameBuilderDDA {
     pub num_threads: usize,
     /// Source for occurrence/abundance distributions (legacy columns or projector)
     pub source: DistributionSource,
+    /// Master seed for the simulation's noise (m/z jitter, precursor-survival draw). Every draw is
+    /// keyed on this seed plus the frame id (`mscore::simulation::noise_rng`), so a run's noise does
+    /// not depend on which thread built a frame. 0 is the default for API users that never set it
+    /// — still reproducible, just seed 0.
+    pub noise_seed: u64,
 }
 
 impl TimsTofLazyFrameBuilderDDA {
+
+    /// Set the master seed for the simulation's noise, making a run reproducible from its config.
+    pub fn set_noise_seed(&mut self, seed: u64) {
+        self.noise_seed = seed;
+    }
     /// Create a new lazy frame builder for DDA.
     ///
     /// Only loads static metadata (frames, scans, transmission settings).
@@ -634,6 +662,7 @@ impl TimsTofLazyFrameBuilderDDA {
             transmission_settings,
             num_threads,
             source,
+            noise_seed: 0,
         })
     }
 
