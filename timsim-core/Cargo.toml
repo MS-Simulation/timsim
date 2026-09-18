@@ -16,7 +16,7 @@ ms-io = "0.2.0"
 # alongside the member. `cargo publish` strips the path and keeps the version constraint.
 timsim-types = { path = "../timsim-types", version = "0.1.0" }
 # Core MS data structures (peptides, spectra) the engine builds on.
-mscore = { version = "0.5.0" }
+mscore = { version = "0.5.1" }
 # Synthetics DB read + analysis.tdf SQLite write.
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 rayon = "1.10.0"

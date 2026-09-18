@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rand::Rng;
+use mscore::simulation::noise_rng::noise_rng;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
@@ -103,9 +104,20 @@ pub struct TimsTofSyntheticsFrameBuilderDIA {
         Option<BTreeMap<(u32, i8, i32), FragmentIonsWithComplementary>>,
     /// Physical instrument capabilities (P5e). Default = Bruker timsTOF.
     pub capabilities: InstrumentCapabilities,
+    /// Master seed for the simulation's noise (m/z jitter, precursor-survival draw). Every draw is
+    /// keyed on this seed plus the frame id (`mscore::simulation::noise_rng`), so a run's noise does
+    /// not depend on which thread built a frame. 0 is the default for API users that never set it
+    /// — still reproducible, just seed 0.
+    pub noise_seed: u64,
 }
 
 impl TimsTofSyntheticsFrameBuilderDIA {
+
+    /// Set the master seed for the simulation's noise, making a run reproducible from its config.
+    pub fn set_noise_seed(&mut self, seed: u64) {
+        self.noise_seed = seed;
+        self.precursor_frame_builder.noise_seed = seed;
+    }
     pub fn new(path: &Path, with_annotations: bool, num_threads: usize) -> rusqlite::Result<Self> {
         Self::new_with_config(path, with_annotations, num_threads, IsotopeTransmissionConfig::default())
     }
@@ -185,6 +197,7 @@ impl TimsTofSyntheticsFrameBuilderDIA {
                     isotope_config,
                     fragment_ions_with_transmission,
                     capabilities,
+                    noise_seed: 0,
                 })
             }
 
@@ -204,6 +217,7 @@ impl TimsTofSyntheticsFrameBuilderDIA {
                     isotope_config,
                     fragment_ions_with_transmission,
                     capabilities,
+                    noise_seed: 0,
                 })
             }
         }
@@ -587,6 +601,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
         intensity_min: Option<f64>,
         right_drag: Option<bool>,
     ) -> TimsFrame {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         // Cache frame-level lookups once
         let ms_type = if self.precursor_frame_builder.precursor_frame_id_set.contains(&frame_id) {
             MsType::Unknown
@@ -730,9 +747,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                         let mz_spectrum = if mz_noise_fragment {
                             if uniform {
-                                final_spectrum.add_mz_noise_uniform(fragment_ppm, right_drag_val)
+                                final_spectrum.add_mz_noise_uniform_with_rng(fragment_ppm, right_drag_val, &mut rng)
                             } else {
-                                final_spectrum.add_mz_noise_normal(fragment_ppm)
+                                final_spectrum.add_mz_noise_normal_with_rng(fragment_ppm, &mut rng)
                             }
                         } else {
                             final_spectrum
@@ -754,7 +771,6 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                     // Add unfragmented precursor ions (survival) if configured
                     if self.isotope_config.has_precursor_survival() {
-                        let mut rng = rand::thread_rng();
                         let survival_fraction = rng.gen_range(
                             self.isotope_config.precursor_survival_min
                             ..=self.isotope_config.precursor_survival_max
@@ -775,9 +791,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                                 let precursor_mz_spectrum = if mz_noise_fragment {
                                     if uniform {
-                                        precursor_scaled.add_mz_noise_uniform(fragment_ppm, right_drag_val)
+                                        precursor_scaled.add_mz_noise_uniform_with_rng(fragment_ppm, right_drag_val, &mut rng)
                                     } else {
-                                        precursor_scaled.add_mz_noise_normal(fragment_ppm)
+                                        precursor_scaled.add_mz_noise_normal_with_rng(fragment_ppm, &mut rng)
                                     }
                                 } else {
                                     precursor_scaled
@@ -956,6 +972,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
         intensity_min: Option<f64>,
         right_drag: Option<bool>,
     ) -> TimsFrameAnnotated {
+        // One RNG per frame, keyed by the master seed and the frame id: the m/z jitter (and the
+        // precursor-survival draw) must not depend on which thread builds the frame.
+        let mut rng = noise_rng(self.noise_seed, &[frame_id as u64]);
         // Cache frame-level lookups
         let ms_type = if self.precursor_frame_builder.precursor_frame_id_set.contains(&frame_id) {
             MsType::Unknown
@@ -1049,9 +1068,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                         let mz_spectrum = if mz_noise_fragment {
                             if uniform {
-                                scaled_spec.add_mz_noise_uniform(fragment_ppm, right_drag_val)
+                                scaled_spec.add_mz_noise_uniform_with_rng(fragment_ppm, right_drag_val, &mut rng)
                             } else {
-                                scaled_spec.add_mz_noise_normal(fragment_ppm)
+                                scaled_spec.add_mz_noise_normal_with_rng(fragment_ppm, &mut rng)
                             }
                         } else {
                             scaled_spec
@@ -1071,7 +1090,6 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                     // Add unfragmented precursor ions (survival) if configured
                     if self.isotope_config.has_precursor_survival() {
-                        let mut rng = rand::thread_rng();
                         let survival_fraction = rng.gen_range(
                             self.isotope_config.precursor_survival_min
                             ..=self.isotope_config.precursor_survival_max
@@ -1095,9 +1113,9 @@ impl TimsTofSyntheticsFrameBuilderDIA {
 
                                 let precursor_final = if mz_noise_fragment {
                                     if uniform {
-                                        precursor_scaled.add_mz_noise_uniform(fragment_ppm, right_drag_val)
+                                        precursor_scaled.add_mz_noise_uniform_with_rng(fragment_ppm, right_drag_val, &mut rng)
                                     } else {
-                                        precursor_scaled.add_mz_noise_normal(fragment_ppm)
+                                        precursor_scaled.add_mz_noise_normal_with_rng(fragment_ppm, &mut rng)
                                     }
                                 } else {
                                     precursor_scaled
@@ -1363,6 +1381,7 @@ mod p6a_fragment_kernel_tests {
             scan_to_mobility: BTreeMap::new(),
             peptide_to_events,
             ion_id_to_peptide_charge: BTreeMap::new(),
+            noise_seed: 0,
         };
 
         let mut fragment_ions = BTreeMap::new();
@@ -1388,6 +1407,7 @@ mod p6a_fragment_kernel_tests {
             isotope_config: IsotopeTransmissionConfig::default(),
             fragment_ions_with_transmission: None,
             capabilities: InstrumentCapabilities::astral(),
+            noise_seed: 0,
         }
     }
 
