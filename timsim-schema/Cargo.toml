@@ -4,7 +4,7 @@ version = "0.2.2"
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"
-repository = "https://github.com/theGreatHerrLebert/timsim"
+repository = "https://github.com/MS-Simulation/timsim"
 description = "The schema contract for timsim v2: one definition of every column, plus read-side validation at every stage boundary."
 
 [dependencies]

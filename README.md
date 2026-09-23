@@ -19,7 +19,7 @@ repositories — this workspace is the library layer they all build on.
 ## Build
 
 ```bash
-git clone https://github.com/theGreatHerrLebert/timsim
+git clone https://github.com/MS-Simulation/timsim
 cd timsim
 cargo build --workspace
 ```

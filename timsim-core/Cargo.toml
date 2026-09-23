@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.84"
 license = "MIT"
 description = "The timsim v2 simulation engine: feature-space assembly, projection, and streaming frame render for timsTOF/Thermo/mzML. Extracted from ms-io::sim (R4)."
-repository = "https://github.com/theGreatHerrLebert/timsim"
+repository = "https://github.com/MS-Simulation/timsim"
 
 [dependencies]
 # The TDF I/O layer: reads a real .d's metadata (data::meta) + writes frames (data::tdf_writer).
