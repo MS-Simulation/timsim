@@ -17,7 +17,8 @@ What is compared, and what is not
 * Real: Precursor.Quantity per charge, per peptide.
 * Two metrics, per (K+R count 1-3, His count 0 / 1 / >=2) cell:
   - dominant: distribution of each peptide's most intense charge (the fit objective; cell-balanced);
-  - shares: mean absolute error between the model's and the observed charge-share vectors. The
+  - shares: mean L1 distance (summed over 2+/3+/4+) between the model's and the observed share
+    vectors. The
     observed vector is censored by identification (an undetected minor state reads as 0), so this
     is a consistency check, not an unbiased fraction estimate.
 * Validation: the fit uses half of FIT_REPORT's peptides (hash split); every number printed for
@@ -62,7 +63,9 @@ def load(report):
     r = pq.read_table(report, columns=["Modified.Sequence", "Stripped.Sequence", "Precursor.Charge",
                                        "Q.Value", "Precursor.Quantity"]).to_pandas()
     r = r[(r["Q.Value"] <= 0.01) & r["Precursor.Charge"].isin(ZS)]
-    r = r[r["Modified.Sequence"].str.replace("(UniMod:4)", "", regex=False) == r["Stripped.Sequence"]]
+    # Exactly the fully carbamidomethylated form: every C as C(UniMod:4), nothing else — the mass in
+    # `model_shares` assumes it, so a bare or partially alkylated C must not be pooled in.
+    r = r[r["Modified.Sequence"] == r["Stripped.Sequence"].str.replace("C", "C(UniMod:4)", regex=False)]
     r = r[r["Stripped.Sequence"].map(lambda s: set(s) <= set(AA))]
     q = r.pivot_table(index="Stripped.Sequence", columns="Precursor.Charge", values="Precursor.Quantity",
                       aggfunc="sum", fill_value=0.0).reindex(columns=list(ZS), fill_value=0.0)
@@ -126,11 +129,11 @@ def main(argv):
             r = evaluate(d, ph, cc, l, h)
             print(f"{name}, {label}: n={len(d)}  agreement run-weighted {r['agree_run']:.3f}, "
                   f"cell-balanced {r['agree_cells']:.3f}; dominant loss {r['loss']:.3f}; "
-                  f"share MAE {r['share_err']:.3f}")
+                  f"share L1 {r['share_err']:.3f}")
             if label.startswith("fitted"):
                 for key, v in sorted(r["cells"].items()):
                     print(f"    K/R {key[0]}, His {key[1]}{'+' if key[1] == 2 else ''}: n={v[0]} "
-                          f"real 2/3/4+ {v[1]}  model {v[2]}  share MAE {v[3]}")
+                          f"real 2/3/4+ {v[1]}  model {v[2]}  share L1 {v[3]}")
     if fixture:
         fx = sample(test, 25, seed=1)[["seq", "dominant"]]
         fx.to_csv(fixture, sep="\t", index=False)
