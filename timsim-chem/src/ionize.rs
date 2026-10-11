@@ -87,12 +87,18 @@ pub enum ChargeModel {
         charged_probability: f64,
         max_charge: u8,
     },
-    /// Per-site protonation probabilities, reflecting actual gas-phase basicity.
+    /// Per-site protonation probabilities, reflecting actual gas-phase basicity, plus a
+    /// length-scaled Coulomb penalty on charge states (see [`ChargeModel::realistic_with`]).
     SiteSpecific {
         n_term: f64,
         arginine: f64,
         lysine: f64,
         histidine: f64,
+        /// Coulomb repulsion between protons: charge state `z >= 2` is weighted by
+        /// `exp(-coulomb · (z(z-1)/2 - 1) / length)` — the proton pairs beyond the two termini's,
+        /// over a separation that grows with the peptide. `0` = independent sites (the pre-0.3
+        /// model, bit-identical).
+        coulomb: f64,
         max_charge: u8,
     },
 }
@@ -138,12 +144,30 @@ impl ChargeModel {
     /// K/R, so its only *third* basic site is almost always a histidine — which makes the observed
     /// 3+ fraction of a tryptic digest very nearly a direct readout of this one number. At 0.20 the
     /// simulated 3+ fraction collapsed to ~6%; real tryptic DIA runs at 20–30%.
+    ///
+    /// # Why there is a Coulomb term, and where 12 comes from
+    ///
+    /// Independent sites are right for a fully tryptic peptide and badly wrong past it. Every
+    /// internal K/R adds a near-certain proton, so a peptide with two missed cleavages came out
+    /// 4+ — and 5+ above the cap — although the protons already present repel the next one. On a
+    /// real HeLa diaPASEF run (G20513, DIA-NN 2.3, 94,074 peptides at 1% FDR) the dominant charge of
+    /// a peptide with three K/R is 2+ 16% / 3+ 59% / 4+ 24%; independent sites predict 2% / 9% / 89%.
+    ///
+    /// The penalty `exp(-coulomb · (z(z-1)/2 - 1) / length)` counts the proton pairs beyond the
+    /// first: the two termini of a tryptic peptide sit a whole peptide apart, so 2+ is not
+    /// penalised (penalising it, as a first form of this term did, pushed a third of short tryptic
+    /// peptides to 1+). Fitted jointly with `histidine` on that run's dominant charge per
+    /// (K/R count, H count) cell, restricted to the m/z window the run could observe (300–1165):
+    /// `coulomb = 14`, `histidine = 0.90`. Per-peptide agreement with the observed dominant charge
+    /// is 0.89 on a sample weighted like the run (0.49 with independent sites) and 0.85 with every
+    /// cell weighted equally. The fit script lives in `timsim-chem/calibration/`.
     pub fn realistic_with(max_charge: u8) -> Self {
         ChargeModel::SiteSpecific {
             n_term: 0.93,
             arginine: 0.97, // most basic of the three
             lysine: 0.95,
-            histidine: 0.80, // below K/R, but protonated at ESI pH — see above
+            histidine: 0.90, // below K/R, but protonated at ESI pH — refitted with `coulomb`
+            coulomb: 14.0,   // fitted on real diaPASEF — see above
             max_charge,
         }
     }
@@ -157,9 +181,9 @@ impl ChargeModel {
                 "binomial: every protonatable site (N-term, H, R, K) at p = {charged_probability}, \
                  z = 1..{max_charge}"
             ),
-            ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine, max_charge } => format!(
+            ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine, coulomb, max_charge } => format!(
                 "site-specific: N-term {n_term}, R {arginine}, K {lysine}, H {histidine}, \
-                 z = 1..{max_charge}"
+                 Coulomb {coulomb}, z = 1..{max_charge}"
             ),
         }
     }
@@ -224,6 +248,11 @@ impl ChargeModel {
         if self.max_charge() == 0 {
             return Err("max_charge must be at least 1".to_string());
         }
+        if let ChargeModel::SiteSpecific { coulomb, .. } = self {
+            if !(coulomb.is_finite() && *coulomb >= 0.0) {
+                return Err(format!("coulomb must be finite and >= 0, got {coulomb}"));
+            }
+        }
         Ok(())
     }
 
@@ -268,6 +297,19 @@ impl ChargeModel {
                 }
                 pmf[k + 1] += v * p;
                 pmf[k] = v * (1.0 - p);
+            }
+        }
+
+        // Coulomb repulsion reweights the charge states before anything is removed, so both removals
+        // below see the physical distribution. `coulomb == 0` skips it: bit-identical to the
+        // independent-site model.
+        if let ChargeModel::SiteSpecific { coulomb, .. } = self {
+            if *coulomb > 0.0 {
+                let len = sequence.len().max(1) as f64;
+                // z = 2 carries no penalty: its two protons sit at the termini.
+                for (z, v) in pmf.iter_mut().enumerate().skip(3) {
+                    *v *= (-coulomb * ((z * (z - 1)) as f64 / 2.0 - 1.0) / len).exp();
+                }
             }
         }
 
@@ -796,7 +838,7 @@ mod tests {
     fn the_poisson_binomial_reduces_to_the_binomial() {
         let binom = ChargeModel::Binomial { charged_probability: 0.8, max_charge: 4 };
         let flat = ChargeModel::SiteSpecific {
-            n_term: 0.8, arginine: 0.8, lysine: 0.8, histidine: 0.8, max_charge: 4,
+            n_term: 0.8, arginine: 0.8, lysine: 0.8, histidine: 0.8, coulomb: 0.0, max_charge: 4,
         };
         for seq in ["PEPTIDEK", "KRHPEPTIDEKR", "PEPTIDEHK", "AAAAAA"] {
             let a = binom.distribution(seq);
@@ -831,25 +873,39 @@ mod tests {
     ///
     /// Histidine sits below K/R but is *protonated at ESI pH* — it is not a bystander. Because a
     /// fully-tryptic peptide's only third basic site is almost always a histidine, an
-    /// under-weighted `p(H)` shows up as a digest with almost no 3+ precursors. Pinning the
-    /// per-peptide fact directly: a tryptic peptide carrying one histidine is predominantly 3+.
+    /// under-weighted `p(H)` shows up as a digest with almost no 3+ precursors.
     ///
-    /// At `p(H) = 0.20` this peptide came out 17.7% 3+ and the test fails, which is exactly what
-    /// should have happened the first time.
+    /// This test used to assert that such a peptide is *predominantly* 3+. Real data says
+    /// otherwise: on a HeLa diaPASEF run (G20513, 2,007 fully tryptic peptides carrying one His)
+    /// the dominant charge is 2+ for 75% and 3+ for 25%. The pinned fact is therefore the one the
+    /// `p(H) = 0.20` bug broke and real data supports — a substantial, not dominant, 3+ share —
+    /// checked on a sequence long enough that Coulomb repulsion does not decide it alone, and on
+    /// the per-cell agreement with the real run (see the aggregate test below).
     #[test]
-    fn a_histidine_bearing_tryptic_peptide_is_predominantly_triply_charged() {
-        let d = ChargeModel::realistic().distribution("PEPTIDEHK"); // N-term + H + K
-        let f3 = d.iter().find(|(z, _)| *z == 3).map(|(_, f)| *f).unwrap_or(0.0);
+    fn a_histidine_bearing_tryptic_peptide_carries_a_real_triply_charged_share() {
+        let m = ChargeModel::realistic();
+        let f3 = |s: &str| m.distribution(s).iter().find(|(z, _)| *z == 3).map(|(_, f)| *f).unwrap_or(0.0);
+        let long = f3("GFAFVTFDDHDSVDK"); // 15 residues, N-term + H + K
         assert!(
-            f3 > 0.5,
-            "one histidine plus a tryptic C-terminal K is three real basic sites; \
-             3+ should dominate, got {:.1}%",
-            f3 * 100.0
+            (0.15..0.7).contains(&long),
+            "one histidine plus a tryptic C-terminal K should give a substantial 3+ share, got {:.1}%",
+            long * 100.0
         );
+        // Without the histidine there is no third site and 3+ all but vanishes.
+        assert!(f3("GFAFVTFDDADSVDK") < 0.05);
+        // At p(H) = 0.20 the share collapses — the regression this test exists for.
+        let ChargeModel::SiteSpecific { n_term, arginine, lysine, coulomb, max_charge, .. } = m else {
+            unreachable!("realistic() is site-specific")
+        };
+        let low = ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine: 0.20, coulomb, max_charge };
+        let low3 = low.distribution("GFAFVTFDDHDSVDK").iter().find(|(z, _)| *z == 3).map(|(_, f)| *f).unwrap_or(0.0);
+        assert!(low3 < long / 2.0, "p(H) = 0.20 must visibly collapse the 3+ share: {low3:.3} vs {long:.3}");
     }
 
     /// The aggregate that the per-peptide bug destroyed: across a tryptic-like peptide set, the
-    /// 3+ fraction must land in the band real tryptic DIA actually shows (~20–30%). A `p(H)` that
+    /// 3+ fraction must land in the band real tryptic DIA actually shows. Measured, not quoted:
+    /// fully tryptic precursors on a HeLa diaPASEF run (G20513, DIA-NN 2.3, 1% FDR, charges 2–4)
+    /// are 84.6% 2+ / 14.4% 3+ / 1.0% 4+ — below the ~20–30% this test once assumed. A `p(H)` that
     /// is too low silently collapses this to a few percent while every *per-peptide* distribution
     /// still looks individually plausible — which is precisely why this is asserted on the
     /// aggregate and not on one sequence.
@@ -873,8 +929,8 @@ mod tests {
         let observable: f64 = mass[2..].iter().sum();
         let f3 = mass[3] / observable;
         assert!(
-            (0.15..0.35).contains(&f3),
-            "3+ fraction of a tryptic digest should be ~20-30%, got {:.1}%",
+            (0.05..0.30).contains(&f3),
+            "3+ fraction of a tryptic digest should be near the measured 14.4%, got {:.1}%",
             f3 * 100.0
         );
     }
@@ -890,19 +946,68 @@ mod tests {
         assert!(f1 < 0.15, "too many 1+: {f1:.3} (v1's binomial gives 0.33)");
     }
 
+    /// The Coulomb term's reason to exist: a peptide with two missed cleavages (three K/R plus the
+    /// N-terminus) is dominantly 3+ on a real run (G20513: 2+ 18% / 3+ 64% / 4+ 17%), where
+    /// independent sites made it 4+ and pushed real mass above the cap.
+    #[test]
+    fn missed_cleavage_peptides_are_triply_not_quadruply_charged() {
+        let m = ChargeModel::realistic();
+        let ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine, max_charge, .. } = m else {
+            unreachable!()
+        };
+        let independent = ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine, coulomb: 0.0, max_charge };
+        let dominant = |m: &ChargeModel, s: &str| {
+            m.distribution(s).into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap().0
+        };
+        for seq in ["AVDSLKEIGKSTLER", "LQEKAEELRQSVTGK", "SGDEMIFDPTMSKKTER"] {
+            assert_eq!(dominant(&m, seq), 3, "{seq}: {:?}", m.distribution(seq));
+            assert_eq!(dominant(&independent, seq), 4, "{seq}: the independent model is the bug");
+            let (_, loss) = m.distribution_with_loss(seq);
+            let (_, loss_ind) = independent.distribution_with_loss(seq);
+            assert!(loss < 0.02 && loss < loss_ind, "{seq}: cap loss {loss:.3} vs independent {loss_ind:.3}");
+        }
+        // A clean tryptic peptide is untouched by the term: 2+ is not penalised, so no mass moves to 1+.
+        let f1 = |m: &ChargeModel| m.distribution("PEPTIDEK").iter().find(|(z, _)| *z == 1).map(|(_, f)| *f).unwrap();
+        assert_relative_eq!(f1(&m), f1(&independent), epsilon = 1e-6);
+    }
+
+    #[test]
+    fn coulomb_zero_is_bit_identical_to_independent_sites() {
+        // The pre-0.3 model, recomputed by hand for one sequence: N-term + K + H.
+        let m = ChargeModel::SiteSpecific { n_term: 0.93, arginine: 0.97, lysine: 0.95, histidine: 0.8, coulomb: 0.0, max_charge: 4 };
+        let (p0, p1, p2) = (0.93f64, 0.95, 0.8);
+        let z1 = p0 * (1.0 - p1) * (1.0 - p2) + (1.0 - p0) * p1 * (1.0 - p2) + (1.0 - p0) * (1.0 - p1) * p2;
+        let z3 = p0 * p1 * p2;
+        let z2 = 1.0 - (1.0 - p0) * (1.0 - p1) * (1.0 - p2) - z1 - z3;
+        let ion = z1 + z2 + z3;
+        let d = m.distribution("PEPTIDEHK");
+        for (z, want) in [(1u8, z1 / ion), (2, z2 / ion), (3, z3 / ion)] {
+            let got = d.iter().find(|(q, _)| *q == z).unwrap().1;
+            assert_relative_eq!(got as f64, want, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn invalid_coulomb_is_rejected() {
+        for c in [-1.0, f64::NAN, f64::INFINITY] {
+            let m = ChargeModel::SiteSpecific { n_term: 0.9, arginine: 0.9, lysine: 0.9, histidine: 0.9, coulomb: c, max_charge: 4 };
+            assert!(m.validate().is_err(), "coulomb {c} accepted");
+        }
+    }
+
     #[test]
     fn invalid_models_are_rejected() {
         assert!(ChargeModel::Binomial { charged_probability: 1.5, max_charge: 4 }.validate().is_err());
         assert!(ChargeModel::Binomial { charged_probability: 0.8, max_charge: 0 }.validate().is_err());
         assert!(ChargeModel::SiteSpecific {
-            n_term: 1.2, arginine: 0.9, lysine: 0.9, histidine: 0.2, max_charge: 4
+            n_term: 1.2, arginine: 0.9, lysine: 0.9, histidine: 0.2, coulomb: 0.0, max_charge: 4
         }.validate().is_err());
 
         // A model that cannot protonate anything must be refused — it can produce no ions, and the
         // degenerate path once fabricated a 1+ with fraction 1.0 for exactly this configuration.
         assert!(ChargeModel::Binomial { charged_probability: 0.0, max_charge: 4 }.validate().is_err());
         assert!(ChargeModel::SiteSpecific {
-            n_term: 0.0, arginine: 0.0, lysine: 0.0, histidine: 0.0, max_charge: 4
+            n_term: 0.0, arginine: 0.0, lysine: 0.0, histidine: 0.0, coulomb: 0.0, max_charge: 4
         }.validate().is_err());
         // And even if one slipped through, it emits NO ions rather than inventing one.
         let dead = ChargeModel::Binomial { charged_probability: 0.0, max_charge: 4 };
