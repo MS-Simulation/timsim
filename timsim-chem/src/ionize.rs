@@ -157,17 +157,30 @@ impl ChargeModel {
     /// first: the two termini of a tryptic peptide sit a whole peptide apart, so 2+ is not
     /// penalised (penalising it, as a first form of this term did, pushed a third of short tryptic
     /// peptides to 1+). Fitted jointly with `histidine` on that run's dominant charge per
-    /// (K/R count, H count) cell, restricted to the m/z window the run could observe (300–1165):
-    /// `coulomb = 14`, `histidine = 0.90`. Per-peptide agreement with the observed dominant charge
-    /// is 0.89 on a sample weighted like the run (0.49 with independent sites) and 0.85 with every
-    /// cell weighted equally. The fit script lives in `timsim-chem/calibration/`.
+    /// (K/R count, H count) cell on half the run's unmodified peptides, restricted to the m/z window
+    /// it could observe (300–1165), with `histidine` held below `lysine`: `coulomb = 12`,
+    /// `histidine = 0.90`. Per-peptide agreement with the observed dominant charge, run-weighted /
+    /// cell-balanced:
+    ///
+    /// ```text
+    ///                                         independent sites   this model
+    ///   G20513, held-out half (46,515 pep.)     0.72 / 0.43        0.94 / 0.85
+    ///   O240206 timsTOF Pro, never fitted        0.88 / 0.68        0.91 / 0.72
+    /// ```
+    ///
+    /// The second line is the honest one: charge-state mixes differ between instruments and source
+    /// conditions by as much as this model's error (O240206 is far more highly charged — its
+    /// one-missed-cleavage peptides are 69% 3+, G20513's 28%). These are defaults for a modern
+    /// diaPASEF source, not constants of nature; `coulomb` and the site probabilities are fields so
+    /// a run can be matched. The script, `timsim-chem/calibration/charge_coulomb.py`, re-runs the fit
+    /// and both validations and writes the held-out fixture `tests/data/charge_heldout.tsv`.
     pub fn realistic_with(max_charge: u8) -> Self {
         ChargeModel::SiteSpecific {
             n_term: 0.93,
             arginine: 0.97, // most basic of the three
             lysine: 0.95,
             histidine: 0.90, // below K/R, but protonated at ESI pH — refitted with `coulomb`
-            coulomb: 14.0,   // fitted on real diaPASEF — see above
+            coulomb: 12.0,   // fitted on real diaPASEF — see above
             max_charge,
         }
     }
@@ -971,8 +984,40 @@ mod tests {
         assert_relative_eq!(f1(&m), f1(&independent), epsilon = 1e-6);
     }
 
+    /// Pinned to REAL data: 203 held-out peptides of G20513 (never seen by the fit), each with its
+    /// observed most-intense charge, ~25 per (K/R, His) cell. The model's most likely charge among
+    /// those the run could observe (2–4, m/z 300–1165, carbamidomethyl C) must agree on most of them,
+    /// and must beat independent sites by a wide margin. Regenerate with the calibration script.
     #[test]
-    fn coulomb_zero_is_bit_identical_to_independent_sites() {
+    fn the_dominant_charge_matches_held_out_real_peptides() {
+        let text = include_str!("../tests/data/charge_heldout.tsv");
+        let m = ChargeModel::realistic();
+        let ChargeModel::SiteSpecific { n_term, arginine, lysine, max_charge, .. } = m else { unreachable!() };
+        let old = ChargeModel::SiteSpecific { n_term, arginine, lysine, histidine: 0.80, coulomb: 0.0, max_charge };
+        let observable_dominant = |m: &ChargeModel, seq: &str| -> Option<u8> {
+            let mono = crate::mass::monoisotopic(seq).ok()? + 57.02146 * seq.matches('C').count() as f64;
+            m.distribution(seq)
+                .into_iter()
+                .filter(|(z, _)| (2..=4).contains(z) && (300.0..=1165.0).contains(&crate::isotope::mz(mono, *z, 0)))
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                .map(|(z, _)| z)
+        };
+        let (mut n, mut new_ok, mut old_ok) = (0usize, 0usize, 0usize);
+        for line in text.lines().skip(1) {
+            let (seq, z) = line.split_once('\t').unwrap();
+            let z: u8 = z.trim().parse().unwrap();
+            n += 1;
+            new_ok += (observable_dominant(&m, seq) == Some(z)) as usize;
+            old_ok += (observable_dominant(&old, seq) == Some(z)) as usize;
+        }
+        assert!(n > 150, "fixture too small: {n}");
+        let (new, old) = (new_ok as f64 / n as f64, old_ok as f64 / n as f64);
+        assert!(new > 0.75, "agreement with held-out real peptides {new:.3} (independent sites {old:.3})");
+        assert!(new > old + 0.25, "the Coulomb model must clearly beat independent sites: {new:.3} vs {old:.3}");
+    }
+
+    #[test]
+    fn coulomb_zero_matches_the_independent_site_formula() {
         // The pre-0.3 model, recomputed by hand for one sequence: N-term + K + H.
         let m = ChargeModel::SiteSpecific { n_term: 0.93, arginine: 0.97, lysine: 0.95, histidine: 0.8, coulomb: 0.0, max_charge: 4 };
         let (p0, p1, p2) = (0.93f64, 0.95, 0.8);
