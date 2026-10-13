@@ -50,6 +50,9 @@
 //!     Σ_proteins  amount_amol × MW_average × 1e-9  ==  load_ng      exactly, per sample
 //! ```
 //!
+//! where `load_ng` is the sample's condition's own load if it sets one
+//! ([`Condition::load_ng`]), and the design's otherwise.
+//!
 //! If a mixture, an abundance profile, and a load cannot reproduce the requested
 //! nanograms, that is a bug. Same discipline as the digest's residue conservation.
 
@@ -155,6 +158,21 @@ pub struct Condition {
     pub name: String,
     /// organism → mass share.
     pub mix: BTreeMap<String, Share>,
+    /// Total peptide mass on column for this condition's runs, overriding [`DesignSpec::load_ng`].
+    /// `None` ⇒ the design's load — the usual bench protocol, one injection amount for every run.
+    ///
+    /// # Why a condition may need its own load
+    ///
+    /// The shares in `mix` sum to 1, so one shared load fixes every condition's total mass. That is
+    /// right when the shares are what was pipetted. It is wrong for a mixture whose shares are
+    /// *derived* and come out with a different normaliser per condition. The published v1 HYE
+    /// benchmark is one: each protein's amount was its own abundance times an organism factor `f`,
+    /// so B/A is exactly `f_B / f_A`, and a protein's brightness does not depend on how many
+    /// proteins its organism has. Reproducing that here scales each organism's share by
+    /// `c_o = <M>_o · N_o`, renormalised per condition by `Z_s = Σ_o f_s,o · c_o` — and
+    /// `Z_A ≠ Z_B`, so under one shared load the realised B/A is `(f_B / f_A) · (Z_A / Z_B)`. A
+    /// load per condition proportional to `Z_s` makes it exactly `f_B / f_A` again.
+    pub load_ng: Option<f64>,
     /// Number of **biological** replicates (distinct material → distinct amounts).
     pub replicates: u32,
     /// Injections per biological replicate. Same material, so **same amounts**.
@@ -257,7 +275,8 @@ pub struct Complexity {
 pub struct DesignSpec {
     /// Condition against which `true_log2fc` is computed.
     pub reference: String,
-    /// Total peptide mass on column, per run.
+    /// Total peptide mass on column, per run. The default for every condition; a condition may set
+    /// its own ([`Condition::load_ng`]).
     pub load_ng: f64,
     /// How much of the proteome is actually present (§`Complexity`).
     pub complexity: Complexity,
@@ -320,6 +339,9 @@ pub struct ProteinQuantity {
     /// It is deliberately **not** the number the user typed. Applying a fold change and then
     /// renormalising to a fixed load moves every protein, including unregulated ones, so a
     /// requested +1.0 realises as (say) +0.94 and the distortion differs per protein.
+    ///
+    /// A condition with its own load ([`Condition::load_ng`]) moves every protein by the ratio of
+    /// the two loads. That is real material on column, so it is in here too.
     pub true_log2fc: f64,
     /// The **requested** intervention: the log2 fold change authored for *this condition*, or
     /// `None` if this protein was not regulated here. Recorded so a run can be traced back to
@@ -344,14 +366,24 @@ pub struct OrganismRow {
     pub organism: String,
     pub mass_fraction: BTreeMap<String, f64>,
     pub mean_mw: f64,
+    /// The organism's mass ratio against the reference condition AS MIXED, per condition: share ×
+    /// that condition's load, before any regulation. With a shared load the loads cancel and this
+    /// is the share ratio. Regulation then moves the proteins it names and, through the
+    /// renormalisation, every other one; the realised ratio is [`ProteinQuantity::true_log2fc`].
     pub true_log2fc: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DesignReport {
     pub organisms: Vec<OrganismRow>,
+    /// The design-level load — what every condition uses unless it sets its own.
     pub load_ng: f64,
-    /// Worst absolute mass-balance error across samples, in ng. Must be ~0.
+    /// The load each condition was actually resolved at, keyed by condition: its own
+    /// [`Condition::load_ng`] if set, else `load_ng`. Equal to `load_ng` everywhere unless a
+    /// condition overrides it, so a reader can tell "one load" from "several" without the spec.
+    pub condition_load_ng: BTreeMap<String, f64>,
+    /// Worst absolute mass-balance error across samples, in ng, each sample against its own
+    /// condition's load. Must be ~0.
     pub mass_balance_error_ng: f64,
     /// Proteins skipped because they contain non-standard residues (`X`, `B`, `Z`, …). We
     /// cannot compute their mass, and guessing one would corrupt the mass balance silently.
@@ -460,9 +492,9 @@ fn gauss(parts: &[&str], seed: u64) -> f64 {
 ///    else's rank.
 /// 4. `Generative` regulation draws over the **final** present set. It forces nothing, and it
 ///    never overrides an explicit magnitude.
-/// 5. Amounts are renormalised to the declared load, and `true_log2fc` is computed from the
-///    **final** amounts — so the compositional dilution regulation causes is recorded rather
-///    than pretended away.
+/// 5. Amounts are renormalised to the declared load — the condition's own, if it sets one — and
+///    `true_log2fc` is computed from the **final** amounts — so the compositional dilution
+///    regulation causes is recorded rather than pretended away.
 pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, String> {
     // A zero, negative, NaN or infinite load divides by zero in the normalisation below and
     // writes NaN or negative attomole amounts into the answer key — without an error. There is
@@ -527,6 +559,46 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 return Err(format!(
                     "condition {:?}: technical_replicates must be at least 1",
                     c.name
+                ));
+            }
+            // Same rule as the design-level load, for the same reason; named, because only one
+            // condition carries it.
+            if let Some(load) = c.load_ng {
+                if !load.is_finite() || load <= 0.0 {
+                    return Err(format!(
+                        "condition {:?}: load_ng must be finite and strictly positive, got {load}",
+                        c.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // The load each condition is resolved at. Fixed once, here, so the amounts, the mass-balance
+    // check and the report all read the same number. `None` hands back the design's load itself,
+    // so a design that overrides nothing does exactly the arithmetic it always did.
+    let condition_load_ng: BTreeMap<String, f64> = spec
+        .conditions
+        .iter()
+        .map(|c| (c.name.clone(), c.load_ng.unwrap_or(spec.load_ng)))
+        .collect();
+
+    // A load ratio moves every protein of a condition the way a fold change does, so it is held
+    // to the same bound, against the reference — the condition every fold change is taken
+    // against. Two loads that each pass on their own can still be 2^1329 apart (1e-200 and
+    // 1e200 ng), and their ratio then overflows into an infinite `true_log2fc`. Compared in log
+    // space so the message can say how far apart they are. With no override every ratio is 1.
+    // (A reference missing from the conditions is refused further down.)
+    if let Some(&reference_load) = condition_load_ng.get(&spec.reference) {
+        for c in &spec.conditions {
+            let load = condition_load_ng[&c.name];
+            let log2_ratio = load.log2() - reference_load.log2();
+            if log2_ratio.abs() > MAX_ABS_LOG2FC {
+                return Err(format!(
+                    "condition {:?}: load_ng {load:?} ng is 2^{log2_ratio:.1} times the reference \
+                     condition {:?}'s {reference_load:?} ng — a load ratio moves every protein \
+                     like a fold change, so it must stay within 2^±{MAX_ABS_LOG2FC}",
+                    c.name, spec.reference
                 ));
             }
         }
@@ -932,6 +1004,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
     let mut regulated: BTreeMap<String, HashMap<&str, f64>> = BTreeMap::new();
 
     for c in &spec.conditions {
+        let load_ng = condition_load_ng[&c.name];
         // Every usable protein appears in the answer key. Absent ones carry amount 0 — which is what
         // makes a search engine's hit on them a nameable false positive, and protein FDR answerable.
         let mut amounts: HashMap<&str, f64> = HashMap::new();
@@ -944,7 +1017,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
 
         for (org, members) in &by_organism {
             let share = shares[&c.name].get(*org).copied().unwrap_or(0.0);
-            let mass_ng = share * spec.load_ng;
+            let mass_ng = share * load_ng;
             let total_amol = mass::ng_to_amol(mass_ng, mean_mw[*org]);
             for p in members {
                 // Absent from the sample ⇒ amount 0. It stays in the structure, and in the answer
@@ -1007,7 +1080,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
             }
         }
 
-        // Renormalise to the requested load. This is what happens at the bench — you inject
+        // Renormalise to this condition's load. This is what happens at the bench — you inject
         // 200 ng whatever the composition — and it is why `true_log2fc` must be computed
         // from FINAL amounts: a large spike-in compositionally dilutes everything else, and
         // that dilution is real and must appear in the answer key.
@@ -1027,7 +1100,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 c.name
             ));
         }
-        let scale = spec.load_ng / total_ng;
+        let scale = load_ng / total_ng;
         for a in amounts.values_mut() {
             *a *= scale;
         }
@@ -1047,6 +1120,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
     let reference = &condition_amounts[&spec.reference];
 
     for c in &spec.conditions {
+        let load_ng = condition_load_ng[&c.name];
         for bio in 1..=c.replicates {
             let sample_id = format!("{}_R{bio}", c.name);
             samples.push(Sample {
@@ -1099,13 +1173,14 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 amounts.insert(p.id, b * jitter);
             }
 
-            // Variance perturbs composition, so restore the load. Mass balance is exact.
+            // Variance perturbs composition, so restore the load — the sample's condition's, which
+            // is also what the check below holds it to. Mass balance is exact.
             // Vec order, not HashMap order — see the note on the per-condition total above.
             let total_ng: f64 = usable
                 .iter()
                 .map(|p| mass::amol_to_ng(amounts[p.id], mw[p.id]))
                 .sum();
-            let scale = spec.load_ng / total_ng;
+            let scale = load_ng / total_ng;
             for a in amounts.values_mut() {
                 *a *= scale;
             }
@@ -1114,7 +1189,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 .iter()
                 .map(|p| mass::amol_to_ng(amounts[p.id], mw[p.id]))
                 .sum();
-            worst_error = worst_error.max((check_ng - spec.load_ng).abs());
+            worst_error = worst_error.max((check_ng - load_ng).abs());
 
             for p in &usable {
                 let a = amounts[p.id];
@@ -1164,13 +1239,19 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 .map(|(c, s)| (c.clone(), s.get(*org).copied().unwrap_or(0.0)))
                 .collect();
             let ref_share = mass_fraction[&spec.reference];
+            let ref_load = condition_load_ng[&spec.reference];
+            // The organism's mass ratio as mixed is share × load. The share ratio alone is right
+            // only when the two conditions share a load: under per-condition loads it would report
+            // the v1 HYE design's B/A off by exactly the Z_A / Z_B the loads were set to remove.
+            // Written as share ratio × load ratio, not (f·L)/(f_ref·L_ref): with equal loads the
+            // load ratio is exactly 1.0, so the value is bit for bit the share ratio it always was.
             let true_log2fc = mass_fraction
                 .iter()
                 .map(|(c, f)| {
                     (
                         c.clone(),
                         if ref_share > 0.0 && *f > 0.0 {
-                            (f / ref_share).log2()
+                            ((f / ref_share) * (condition_load_ng[c] / ref_load)).log2()
                         } else {
                             f64::NAN
                         },
@@ -1194,6 +1275,7 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
         report: DesignReport {
             organisms: organisms_report,
             load_ng: spec.load_ng,
+            condition_load_ng,
             mass_balance_error_ng: worst_error,
             skipped_proteins: skipped,
             forced_present,
@@ -1249,6 +1331,7 @@ mod tests {
                         ("ECOLI".to_string(), Share::Fraction(0.05)),
                     ]
                     .into(),
+                    load_ng: None,
                     replicates: 3,
                     technical_replicates: 2,
                     regulate: Vec::new(),
@@ -1261,6 +1344,7 @@ mod tests {
                         ("ECOLI".to_string(), Share::Rest), // → 0.20
                     ]
                     .into(),
+                    load_ng: None,
                     replicates: 3,
                     technical_replicates: 2,
                     regulate: Vec::new(),
@@ -1833,6 +1917,7 @@ mod tests {
                 conditions: vec![Condition {
                     name: "A".into(),
                     mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
+                    load_ng: None,
                     replicates: 300,
                     technical_replicates: 1,
                     regulate: Vec::new(),
@@ -1881,6 +1966,7 @@ mod tests {
                 conditions: vec![Condition {
                     name: "A".into(),
                     mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
+                    load_ng: None,
                     replicates: 120, technical_replicates: 1, regulate: Vec::new(),
                 }],
             }
@@ -2054,6 +2140,7 @@ mod tests {
             conditions: vec![Condition {
                 name: "A".into(),
                 mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
+                load_ng: None,
                 replicates: 1, technical_replicates: 1, regulate: Vec::new(),
             }],
         };
@@ -2100,6 +2187,7 @@ mod tests {
             conditions: vec![Condition {
                 name: "A".into(),
                 mix: [("HUMAN".to_string(), Share::Fraction(1.0))].into(),
+                load_ng: None,
                 replicates: 1, technical_replicates: 1, regulate: Vec::new(),
             }],
         };
@@ -2596,5 +2684,338 @@ mod tests {
             })
             .collect();
         assert!(resolve(&s, &dp).is_err());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-condition load. (No override ⇒ bit-identical to 0.3.0: tests/design_load_parity.rs.)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// THE reason `Condition::load_ng` exists: the published v1 HYE benchmark, reproduced exactly.
+    ///
+    /// v1 gave each protein its own abundance times an organism factor `f`, so every protein's true
+    /// B/A is exactly `f_B / f_A`. The v2 construction scales each organism's share by
+    /// `c_o = <M>_o · N_o`, renormalised per condition by `Z_s = Σ_o f_s,o · c_o`, and gives
+    /// condition `s` the load `L · Z_s / Z_A`. `<M>_o` must be the design's OWN mean MW — weighted
+    /// by molar abundance over the present proteins — so this recomputes it from the same draw and
+    /// the same mass function, and checks it against the report, rather than using a look-alike.
+    #[test]
+    fn per_condition_loads_make_the_v1_hye_ratios_exact() {
+        // Different protein counts per organism, and sizes that vary WITHIN each organism, so the
+        // organisms differ in <M>_o and the abundance weighting inside <M>_o actually matters.
+        let mut ps: Vec<(String, String, String)> = Vec::new();
+        let organisms = [("HUMAN", "HUM", 50, 9), ("YEAST", "YST", 30, 6), ("ECOLI", "ECO", 12, 3)];
+        for (org, prefix, n, base) in organisms {
+            for i in 0..n {
+                let seq = "PEPTIDEKAAAKCCCRDDDK".repeat(base + i % 5);
+                ps.push((format!("{prefix}{i}"), seq, org.to_string()));
+            }
+        }
+        let dp = dps(&ps);
+        // v1's organism factors, (organism, f_A, f_B).
+        let f = [("HUMAN", 0.65, 0.65), ("YEAST", 0.30, 0.20), ("ECOLI", 0.05, 0.15)];
+        let factor = |org: &str| -> (f64, f64) {
+            let t = f.iter().find(|t| t.0 == org).unwrap();
+            (t.1, t.2)
+        };
+        let load = 200.0;
+        let base = spec(load, 0.0); // no biological variance: replicates are the condition amounts
+
+        // <M>_o exactly as `resolve` computes it, and N_o = the present proteins (all, here).
+        let members = |org: &str| ps.iter().filter(|p| p.2 == org).collect::<Vec<_>>();
+        let weighted_mw = |org: &str| -> f64 {
+            let sigma = match base.abundance[org] {
+                AbundanceProfile::LogNormal { sigma } => sigma,
+                _ => unreachable!("the fixture is log-normal"),
+            };
+            let raw: Vec<f64> = members(org)
+                .iter()
+                .map(|p| (sigma * gauss(&["abundance", &p.0], base.seed)).exp())
+                .collect();
+            let total: f64 = raw.iter().sum();
+            members(org)
+                .iter()
+                .zip(&raw)
+                .map(|(p, r)| (r / total) * mass::average(&p.1).unwrap())
+                .sum()
+        };
+        let c: BTreeMap<&str, f64> = f
+            .iter()
+            .map(|(org, _, _)| (*org, weighted_mw(org) * members(org).len() as f64))
+            .collect();
+        let z_a: f64 = f.iter().map(|(org, fa, _)| fa * c[org]).sum();
+        let z_b: f64 = f.iter().map(|(org, _, fb)| fb * c[org]).sum();
+        let load_b = load * (z_b / z_a);
+
+        let mut s = base.clone();
+        s.conditions[0].mix =
+            f.iter().map(|(o, fa, _)| (o.to_string(), Share::Fraction(fa * c[o] / z_a))).collect();
+        s.conditions[1].mix =
+            f.iter().map(|(o, _, fb)| (o.to_string(), Share::Fraction(fb * c[o] / z_b))).collect();
+        // A is the reference: L · Z_A / Z_A is the design's own load, so A sets nothing and the
+        // design default is exercised alongside the override.
+        s.conditions[1].load_ng = Some(load_b);
+        let d = resolve(&s, &dp).unwrap();
+
+        // The recomputed <M>_o IS the design's, and the abundance weighting is not a no-op here.
+        for (org, _, _) in &f {
+            let row = d.report.organisms.iter().find(|o| o.organism == *org).unwrap();
+            assert_relative_eq!(weighted_mw(org), row.mean_mw, max_relative = 1e-12);
+            let plain = members(org).iter().map(|p| mass::average(&p.1).unwrap()).sum::<f64>()
+                / members(org).len() as f64;
+            assert!(
+                (row.mean_mw - plain).abs() > 10.0,
+                "{org}: weighted and plain mean MW must differ, else the weighting is untested"
+            );
+        }
+        let distortion = z_a / z_b;
+        assert!((distortion - 1.0).abs() > 0.01, "Z_A/Z_B = {distortion} proves nothing");
+
+        let amount = |d: &Design, sample: &str, id: &str| -> f64 {
+            d.protein_quantities
+                .iter()
+                .find(|q| q.sample_id == sample && q.protein_id == id)
+                .unwrap()
+                .amount_amol
+        };
+        // Every protein, every replicate: B/A is exactly f_B / f_A …
+        for (id, _, org) in &ps {
+            let (fa, fb) = factor(org);
+            for r in 1..=3 {
+                let a = amount(&d, &format!("A_R{r}"), id);
+                let b = amount(&d, &format!("B_R{r}"), id);
+                assert!(a > 0.0);
+                assert_relative_eq!(b / a, fb / fa, max_relative = 1e-12);
+            }
+            let q = d
+                .protein_quantities
+                .iter()
+                .find(|q| q.sample_id == "B_R1" && q.protein_id == *id)
+                .unwrap();
+            assert_relative_eq!(q.true_log2fc, (fb / fa).log2(), epsilon = 1e-12);
+        }
+        // … and so is the organism-level truth in the report.
+        for (org, fa, fb) in &f {
+            let row = d.report.organisms.iter().find(|o| o.organism == *org).unwrap();
+            assert_relative_eq!(row.true_log2fc["B"], (fb / fa).log2(), epsilon = 1e-12);
+        }
+
+        // Each condition carries its OWN load, sample by sample.
+        assert_eq!(d.report.condition_load_ng["A"], load);
+        assert_eq!(d.report.condition_load_ng["B"], load_b);
+        for sample in &d.samples {
+            let want = d.report.condition_load_ng[&sample.condition];
+            let ng: f64 = d
+                .protein_quantities
+                .iter()
+                .filter(|q| q.sample_id == sample.sample_id)
+                .map(|q| {
+                    let seq = &ps.iter().find(|p| p.0 == q.protein_id).unwrap().1;
+                    mass::amol_to_ng(q.amount_amol, mass::average(seq).unwrap())
+                })
+                .sum();
+            assert_relative_eq!(ng, want, max_relative = 1e-12);
+        }
+        assert!(d.report.mass_balance_error_ng < 1e-9, "{}", d.report.mass_balance_error_ng);
+
+        // Without the per-condition load, the same shares give exactly the distorted ratio.
+        let mut shared = s.clone();
+        shared.conditions[1].load_ng = None;
+        let d1 = resolve(&shared, &dp).unwrap();
+        for (id, _, org) in &ps {
+            let (fa, fb) = factor(org);
+            let ratio = amount(&d1, "B_R1", id) / amount(&d1, "A_R1", id);
+            assert_relative_eq!(ratio, (fb / fa) * distortion, max_relative = 1e-12);
+        }
+    }
+
+    /// A load is material on column: the same mixture at twice the load is every protein at twice
+    /// the amount, and the answer key says +1 for all of them — per protein and per organism.
+    #[test]
+    fn a_condition_load_moves_every_protein_by_the_load_ratio() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].mix = s.conditions[0].mix.clone();
+        s.conditions[1].load_ng = Some(400.0);
+        let d = resolve(&s, &dp).unwrap();
+
+        let b: Vec<&ProteinQuantity> =
+            d.protein_quantities.iter().filter(|q| q.sample_id == "B_R1").collect();
+        assert_eq!(b.len(), ps.len());
+        for q in b {
+            assert_relative_eq!(q.true_log2fc, 1.0, epsilon = 1e-12);
+        }
+        for o in &d.report.organisms {
+            assert_relative_eq!(o.true_log2fc["B"], 1.0, epsilon = 1e-12);
+            assert_relative_eq!(o.mass_fraction["B"], o.mass_fraction["A"]); // same mixture
+        }
+    }
+
+    /// With biological variance on, every SAMPLE is rescaled to — and checked against — its own
+    /// condition's load, and a design-level load that no condition uses leaks into nothing.
+    #[test]
+    fn every_sample_balances_against_its_own_conditions_load() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mw: HashMap<&str, f64> = ps
+            .iter()
+            .map(|(id, seq, _)| (id.as_str(), mass::average(seq).unwrap()))
+            .collect();
+
+        let mut s = spec(1.0, 0.25); // a default that no condition uses
+        s.variance.biological_heterogeneity = 0.5;
+        s.conditions[0].load_ng = Some(50.0);
+        s.conditions[1].load_ng = Some(400.0);
+        let d = resolve(&s, &dp).unwrap();
+
+        let want = BTreeMap::from([("A".to_string(), 50.0), ("B".to_string(), 400.0)]);
+        assert_eq!(d.report.condition_load_ng, want);
+        assert_eq!(d.report.load_ng, 1.0, "the report keeps the design-level default too");
+        for sample in &d.samples {
+            let ng: f64 = d
+                .protein_quantities
+                .iter()
+                .filter(|q| q.sample_id == sample.sample_id)
+                .map(|q| mass::amol_to_ng(q.amount_amol, mw[q.protein_id.as_str()]))
+                .sum();
+            assert_relative_eq!(ng, want[&sample.condition], max_relative = 1e-12);
+        }
+        assert!(d.report.mass_balance_error_ng < 1e-9, "{}", d.report.mass_balance_error_ng);
+    }
+
+    /// A condition's load is held to the design load's rule — finite and strictly positive — and
+    /// the error names the condition, because only that condition carries the bad number.
+    #[test]
+    fn invalid_condition_loads_are_rejected_and_named() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        for bad in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut s = spec(200.0, 0.0);
+            s.conditions[1].load_ng = Some(bad);
+            let err = resolve(&s, &dp).unwrap_err();
+            assert!(
+                err.contains("condition \"B\"") && err.contains("load_ng"),
+                "load_ng = {bad}: {err}"
+            );
+        }
+
+        // The design-level load stays required, and validated, even when every condition sets its
+        // own: it is the default, and an unusable default is refused rather than carried along.
+        let mut s = spec(f64::NAN, 0.0);
+        for c in &mut s.conditions {
+            c.load_ng = Some(100.0);
+        }
+        assert!(resolve(&s, &dp).is_err());
+
+        // Small but positive is a load.
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].load_ng = Some(1e-3);
+        assert!(resolve(&s, &dp).is_ok());
+    }
+
+    /// With regulation (explicit and generative), biological variance, `n_proteins` and an
+    /// overridden REFERENCE load, a condition's load is still a pure scale on that condition:
+    /// every amount is the shared-load amount × L_c / L_design, every realised fold change moves
+    /// by exactly log2(L_c / L_ref), and nothing that is not a quantity — what was requested,
+    /// what is regulated, what is present — moves at all.
+    #[test]
+    fn a_condition_load_is_a_pure_scale_under_regulation_and_variance() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mw: HashMap<&str, f64> = ps
+            .iter()
+            .map(|(id, seq, _)| (id.as_str(), mass::average(seq).unwrap()))
+            .collect();
+
+        let mut shared = spec(200.0, 0.2);
+        shared.variance.biological_heterogeneity = 0.5;
+        shared.complexity = Complexity { n_proteins: Some(60) };
+        shared.conditions[1].regulate = vec![
+            Regulation::Explicit {
+                proteins: [("HUM0".to_string(), 1.6), ("YST3".to_string(), -0.7)]
+                    .into_iter()
+                    .collect(),
+            },
+            Regulation::Generative { fraction: 0.2, log2fc_sd: 1.0 },
+        ];
+        let d0 = resolve(&shared, &dp).unwrap();
+
+        let mut own = shared.clone();
+        own.conditions[0].load_ng = Some(50.0); // the reference
+        own.conditions[1].load_ng = Some(350.0);
+        let d1 = resolve(&own, &dp).unwrap();
+        let load = |condition: &str| if condition == "A" { 50.0 } else { 350.0 };
+
+        assert_eq!(d0.protein_quantities.len(), d1.protein_quantities.len());
+        for (q0, q1) in d0.protein_quantities.iter().zip(&d1.protein_quantities) {
+            assert_eq!((&q0.protein_id, &q0.sample_id), (&q1.protein_id, &q1.sample_id));
+            let l = load(&q0.sample_id[..1]);
+            assert_relative_eq!(q1.amount_amol, q0.amount_amol * (l / 200.0), max_relative = 1e-12);
+            if q0.true_log2fc.is_nan() {
+                assert!(q1.true_log2fc.is_nan(), "{} {}", q1.protein_id, q1.sample_id);
+            } else {
+                let moved = q0.true_log2fc + (l / 50.0).log2();
+                assert_relative_eq!(q1.true_log2fc, moved, epsilon = 1e-12);
+            }
+            assert_eq!(q1.requested_log2fc, q0.requested_log2fc);
+            assert_eq!(q1.is_regulated, q0.is_regulated);
+        }
+        for (o0, o1) in d0.report.organisms.iter().zip(&d1.report.organisms) {
+            for (c, fc0) in &o0.true_log2fc {
+                let moved = fc0 + (load(c) / 50.0).log2();
+                assert_relative_eq!(o1.true_log2fc[c], moved, epsilon = 1e-12);
+            }
+        }
+        assert_eq!(d1.report.forced_present, d0.report.forced_present);
+        assert_eq!(d1.report.displaced, d0.report.displaced);
+
+        for sample in &d1.samples {
+            let ng: f64 = d1
+                .protein_quantities
+                .iter()
+                .filter(|q| q.sample_id == sample.sample_id)
+                .map(|q| mass::amol_to_ng(q.amount_amol, mw[q.protein_id.as_str()]))
+                .sum();
+            assert_relative_eq!(ng, load(&sample.condition), max_relative = 1e-12);
+        }
+        assert!(d1.report.mass_balance_error_ng < 1e-9, "{}", d1.report.mass_balance_error_ng);
+
+        // The fixture exercised what it claims: both kinds of regulation, and absent proteins.
+        let b1 = || d1.protein_quantities.iter().filter(|q| q.sample_id == "B_R1");
+        assert!(b1().any(|q| q.requested_log2fc == Some(1.6) && q.is_regulated));
+        assert!(b1().filter(|q| q.is_regulated).count() > 2, "the generative draw must land too");
+        assert!(b1().any(|q| q.amount_amol == 0.0), "n_proteins must exclude something");
+    }
+
+    /// Two loads that each pass on their own can still be 2^1329 apart, and their ratio overflows
+    /// into an infinite fold change. A load ratio moves every protein like a fold change, so it is
+    /// held to the same bound, against the reference — the condition every fold change is taken
+    /// against.
+    #[test]
+    fn a_load_ratio_beyond_the_fold_change_bound_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let mut s = spec(200.0, 0.0);
+        s.conditions[0].load_ng = Some(1e-200);
+        s.conditions[1].load_ng = Some(1e200);
+        let err = resolve(&s, &dp).unwrap_err();
+        // Named, with both numbers readable: 1e200, not a 201-digit expansion.
+        assert!(err.contains("condition \"B\": load_ng 1e200 ng is 2^1328.8"), "{err}");
+
+        // Past the bound from either side, refused — whichever condition carries the override.
+        for (i, factor) in [(1, 2f64.powi(65)), (1, 2f64.powi(-65)), (0, 2f64.powi(65))] {
+            let mut s = spec(200.0, 0.0);
+            s.conditions[i].load_ng = Some(200.0 * factor);
+            assert!(resolve(&s, &dp).is_err(), "condition {i} at {factor}x must be refused");
+        }
+
+        // Inside it, resolved, and every fold change in the answer key is finite.
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].load_ng = Some(200.0 * 2f64.powi(63));
+        let d = resolve(&s, &dp).unwrap();
+        assert!(d.protein_quantities.iter().all(|q| q.amount_amol.is_finite()));
+        assert!(d.protein_quantities.iter().all(|q| q.true_log2fc.is_finite()));
+        assert!(d.report.organisms.iter().all(|o| o.true_log2fc.values().all(|x| x.is_finite())));
     }
 }

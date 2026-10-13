@@ -1,6 +1,6 @@
 [package]
 name = "timsim-chem"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.84"
 license = "MIT"
@@ -16,3 +16,7 @@ rayon = "1.10"
 ms-chem = "0.1.0"
 mscore = "0.5.0"
 approx = "0.5"
+# Byte-identity gate for the per-condition load (tests/design_load_parity.rs): a design that sets no
+# per-condition load must resolve bit for bit as the last release without the field did. The old
+# side is that published release itself, pinned exactly, not a copy of its code that could drift.
+timsim-chem-v030 = { package = "timsim-chem", version = "=0.3.0" }
