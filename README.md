@@ -69,6 +69,12 @@ cargo test --workspace
 `timsim-chem` carries cross-implementation parity tests against the published `ms-chem` / `mscore`
 (dev-dependencies only — they are not in the build graph of the library).
 
+It also pins its own previous release, `timsim-chem 0.3.0`, as a dev-dependency: a design that sets
+no per-condition load must resolve bit for bit as that release did (`tests/design_load_parity.rs`).
+With two `timsim-chem` versions in the graph, `-p timsim-chem` is ambiguous from the workspace root,
+so name the version (`cargo test -p timsim-chem@0.4.0`) or run cargo inside `timsim-chem/`.
+`cargo package` / `cargo publish -p timsim-chem` only look at workspace members and are unaffected.
+
 **`timsim-chem/xcheck/` is a separate workspace**, not a member of this one, and is not tracked in
 this repository. It is an on-demand validation harness that cross-checks the digest against
 [Sage](https://github.com/lazear/sage); `sage-core` is an entire search engine and has no business
