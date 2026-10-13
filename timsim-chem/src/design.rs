@@ -366,8 +366,10 @@ pub struct OrganismRow {
     pub organism: String,
     pub mass_fraction: BTreeMap<String, f64>,
     pub mean_mw: f64,
-    /// The organism's mass ratio against the reference condition, per condition: share × that
-    /// condition's load. With a shared load the loads cancel and this is the share ratio.
+    /// The organism's mass ratio against the reference condition AS MIXED, per condition: share ×
+    /// that condition's load, before any regulation. With a shared load the loads cancel and this
+    /// is the share ratio. Regulation then moves the proteins it names and, through the
+    /// renormalisation, every other one; the realised ratio is [`ProteinQuantity::true_log2fc`].
     pub true_log2fc: BTreeMap<String, f64>,
 }
 
@@ -580,6 +582,27 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
         .iter()
         .map(|c| (c.name.clone(), c.load_ng.unwrap_or(spec.load_ng)))
         .collect();
+
+    // A load ratio moves every protein of a condition the way a fold change does, so it is held
+    // to the same bound, against the reference — the condition every fold change is taken
+    // against. Two loads that each pass on their own can still be 2^1329 apart (1e-200 and
+    // 1e200 ng), and their ratio then overflows into an infinite `true_log2fc`. Compared in log
+    // space so the message can say how far apart they are. With no override every ratio is 1.
+    // (A reference missing from the conditions is refused further down.)
+    if let Some(&reference_load) = condition_load_ng.get(&spec.reference) {
+        for c in &spec.conditions {
+            let load = condition_load_ng[&c.name];
+            let log2_ratio = load.log2() - reference_load.log2();
+            if log2_ratio.abs() > MAX_ABS_LOG2FC {
+                return Err(format!(
+                    "condition {:?}: load_ng {load:?} ng is 2^{log2_ratio:.1} times the reference \
+                     condition {:?}'s {reference_load:?} ng — a load ratio moves every protein \
+                     like a fold change, so it must stay within 2^±{MAX_ABS_LOG2FC}",
+                    c.name, spec.reference
+                ));
+            }
+        }
+    }
 
     // ── regulation: validate FIRST, because presence now depends on it ────────
     //
@@ -1217,11 +1240,11 @@ pub fn resolve(spec: &DesignSpec, proteins: &[DesignProtein]) -> Result<Design, 
                 .collect();
             let ref_share = mass_fraction[&spec.reference];
             let ref_load = condition_load_ng[&spec.reference];
-            // The organism's MASS ratio is share × load. The share ratio alone is right only when
-            // the two conditions share a load: under per-condition loads it would report the v1 HYE
-            // design's B/A off by exactly the Z_A / Z_B the loads were set to remove. Written as
-            // share ratio × load ratio, not (f·L)/(f_ref·L_ref): with equal loads the load ratio is
-            // exactly 1.0, so the value is bit for bit the share ratio it always was.
+            // The organism's mass ratio as mixed is share × load. The share ratio alone is right
+            // only when the two conditions share a load: under per-condition loads it would report
+            // the v1 HYE design's B/A off by exactly the Z_A / Z_B the loads were set to remove.
+            // Written as share ratio × load ratio, not (f·L)/(f_ref·L_ref): with equal loads the
+            // load ratio is exactly 1.0, so the value is bit for bit the share ratio it always was.
             let true_log2fc = mass_fraction
                 .iter()
                 .map(|(c, f)| {
@@ -2888,5 +2911,111 @@ mod tests {
         let mut s = spec(200.0, 0.0);
         s.conditions[1].load_ng = Some(1e-3);
         assert!(resolve(&s, &dp).is_ok());
+    }
+
+    /// With regulation (explicit and generative), biological variance, `n_proteins` and an
+    /// overridden REFERENCE load, a condition's load is still a pure scale on that condition:
+    /// every amount is the shared-load amount × L_c / L_design, every realised fold change moves
+    /// by exactly log2(L_c / L_ref), and nothing that is not a quantity — what was requested,
+    /// what is regulated, what is present — moves at all.
+    #[test]
+    fn a_condition_load_is_a_pure_scale_under_regulation_and_variance() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+        let mw: HashMap<&str, f64> = ps
+            .iter()
+            .map(|(id, seq, _)| (id.as_str(), mass::average(seq).unwrap()))
+            .collect();
+
+        let mut shared = spec(200.0, 0.2);
+        shared.variance.biological_heterogeneity = 0.5;
+        shared.complexity = Complexity { n_proteins: Some(60) };
+        shared.conditions[1].regulate = vec![
+            Regulation::Explicit {
+                proteins: [("HUM0".to_string(), 1.6), ("YST3".to_string(), -0.7)]
+                    .into_iter()
+                    .collect(),
+            },
+            Regulation::Generative { fraction: 0.2, log2fc_sd: 1.0 },
+        ];
+        let d0 = resolve(&shared, &dp).unwrap();
+
+        let mut own = shared.clone();
+        own.conditions[0].load_ng = Some(50.0); // the reference
+        own.conditions[1].load_ng = Some(350.0);
+        let d1 = resolve(&own, &dp).unwrap();
+        let load = |condition: &str| if condition == "A" { 50.0 } else { 350.0 };
+
+        assert_eq!(d0.protein_quantities.len(), d1.protein_quantities.len());
+        for (q0, q1) in d0.protein_quantities.iter().zip(&d1.protein_quantities) {
+            assert_eq!((&q0.protein_id, &q0.sample_id), (&q1.protein_id, &q1.sample_id));
+            let l = load(&q0.sample_id[..1]);
+            assert_relative_eq!(q1.amount_amol, q0.amount_amol * (l / 200.0), max_relative = 1e-12);
+            if q0.true_log2fc.is_nan() {
+                assert!(q1.true_log2fc.is_nan(), "{} {}", q1.protein_id, q1.sample_id);
+            } else {
+                let moved = q0.true_log2fc + (l / 50.0).log2();
+                assert_relative_eq!(q1.true_log2fc, moved, epsilon = 1e-12);
+            }
+            assert_eq!(q1.requested_log2fc, q0.requested_log2fc);
+            assert_eq!(q1.is_regulated, q0.is_regulated);
+        }
+        for (o0, o1) in d0.report.organisms.iter().zip(&d1.report.organisms) {
+            for (c, fc0) in &o0.true_log2fc {
+                let moved = fc0 + (load(c) / 50.0).log2();
+                assert_relative_eq!(o1.true_log2fc[c], moved, epsilon = 1e-12);
+            }
+        }
+        assert_eq!(d1.report.forced_present, d0.report.forced_present);
+        assert_eq!(d1.report.displaced, d0.report.displaced);
+
+        for sample in &d1.samples {
+            let ng: f64 = d1
+                .protein_quantities
+                .iter()
+                .filter(|q| q.sample_id == sample.sample_id)
+                .map(|q| mass::amol_to_ng(q.amount_amol, mw[q.protein_id.as_str()]))
+                .sum();
+            assert_relative_eq!(ng, load(&sample.condition), max_relative = 1e-12);
+        }
+        assert!(d1.report.mass_balance_error_ng < 1e-9, "{}", d1.report.mass_balance_error_ng);
+
+        // The fixture exercised what it claims: both kinds of regulation, and absent proteins.
+        let b1 = || d1.protein_quantities.iter().filter(|q| q.sample_id == "B_R1");
+        assert!(b1().any(|q| q.requested_log2fc == Some(1.6) && q.is_regulated));
+        assert!(b1().filter(|q| q.is_regulated).count() > 2, "the generative draw must land too");
+        assert!(b1().any(|q| q.amount_amol == 0.0), "n_proteins must exclude something");
+    }
+
+    /// Two loads that each pass on their own can still be 2^1329 apart, and their ratio overflows
+    /// into an infinite fold change. A load ratio moves every protein like a fold change, so it is
+    /// held to the same bound, against the reference — the condition every fold change is taken
+    /// against.
+    #[test]
+    fn a_load_ratio_beyond_the_fold_change_bound_is_rejected() {
+        let ps = hye_proteins();
+        let dp = dps(&ps);
+
+        let mut s = spec(200.0, 0.0);
+        s.conditions[0].load_ng = Some(1e-200);
+        s.conditions[1].load_ng = Some(1e200);
+        let err = resolve(&s, &dp).unwrap_err();
+        // Named, with both numbers readable: 1e200, not a 201-digit expansion.
+        assert!(err.contains("condition \"B\": load_ng 1e200 ng is 2^1328.8"), "{err}");
+
+        // Past the bound from either side, refused — whichever condition carries the override.
+        for (i, factor) in [(1, 2f64.powi(65)), (1, 2f64.powi(-65)), (0, 2f64.powi(65))] {
+            let mut s = spec(200.0, 0.0);
+            s.conditions[i].load_ng = Some(200.0 * factor);
+            assert!(resolve(&s, &dp).is_err(), "condition {i} at {factor}x must be refused");
+        }
+
+        // Inside it, resolved, and every fold change in the answer key is finite.
+        let mut s = spec(200.0, 0.0);
+        s.conditions[1].load_ng = Some(200.0 * 2f64.powi(63));
+        let d = resolve(&s, &dp).unwrap();
+        assert!(d.protein_quantities.iter().all(|q| q.amount_amol.is_finite()));
+        assert!(d.protein_quantities.iter().all(|q| q.true_log2fc.is_finite()));
+        assert!(d.report.organisms.iter().all(|o| o.true_log2fc.values().all(|x| x.is_finite())));
     }
 }
